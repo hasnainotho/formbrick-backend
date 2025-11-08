@@ -1,6 +1,6 @@
 # Top-level wrapper so `uvicorn main:app` works from project root.
 # This imports the FastAPI `app` instance defined in `app/main.py`.
-from app.main import app
+from app.app import app
 
 # Optionally, you could add a simple guard to run with `python main.py`,
 # but uvicorn will import `app` from this module directly.
