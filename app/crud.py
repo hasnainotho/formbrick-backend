@@ -2,6 +2,7 @@ from sqlalchemy.orm import Session
 from . import models
 import uuid
 from typing import List, Optional, Any
+import json
 
 
 def gen_id() -> str:
@@ -22,9 +23,44 @@ def create_form(db: Session, form_data: dict) -> models.Form:
     db.add(form)
     db.flush()
 
+    # When creating multiple questions in a single request the frontend may
+    # reference temporary ids in conditional logic (e.g. "temp-...") that need
+    # to be remapped to the actual persisted question ids. Build an id_map from
+    # the incoming question ids to new/generated ids, then replace any
+    # occurrences inside conditional logic conditions.
     questions = form_data.get('questions') or []
+    id_map: dict = {}
+    # first pass: allocate persistent ids for each incoming question id
+    for q in questions:
+        incoming_id = q.get('id')
+        if incoming_id and str(incoming_id).startswith('temp-'):
+            id_map[incoming_id] = gen_id()
+        elif incoming_id:
+            id_map[incoming_id] = incoming_id
+        else:
+            # no incoming id, generate one and map the None key to it (rare)
+            new_id = gen_id()
+            id_map[incoming_id] = new_id
+
+    # second pass: create question rows using the mapped ids and remapped
+    # conditional logic
     for idx, q in enumerate(questions):
-        qid = q.get('id') or gen_id()
+        incoming_id = q.get('id')
+        qid = id_map.get(incoming_id) or gen_id()
+
+        # remap conditional logic references to persistent ids
+        cl = q.get('conditional_logic') or q.get('conditionalLogic')
+        if cl:
+            try:
+                conditions = cl.get('conditions') or []
+                for cond in conditions:
+                    dep = cond.get('questionId')
+                    if dep in id_map:
+                        cond['questionId'] = id_map[dep]
+            except Exception:
+                # if conditional logic isn't shaped as expected, leave as-is
+                pass
+
         question = models.Question(
             id=qid,
             form_id=form.id,
@@ -32,7 +68,7 @@ def create_form(db: Session, form_data: dict) -> models.Form:
             question_type=q.get('question_type') or q.get('questionType'),
             options=q.get('options'),
             validation_rules=q.get('validation_rules') or q.get('validationRules'),
-            conditional_logic=q.get('conditional_logic') or q.get('conditionalLogic'),
+            conditional_logic=cl,
             is_required=q.get('is_required') or q.get('isRequired', False),
             order_index=q.get('order_index') or q.get('orderIndex') or idx,
             section=q.get('section'),
@@ -77,11 +113,34 @@ def assign_form_to_ticket(db: Session, ticket_id: str, form_id: str):
 
 def submit_response(db: Session, payload: dict) -> models.FormResponse:
     rid = gen_id()
+
+    # ensure respondent exists (avoid FK violation). If respondentId is provided but
+    # the referenced user doesn't exist we'll create a minimal user only when an
+    # email is provided; otherwise treat the response as anonymous by clearing
+    # respondent_id.
+    respondent_id = payload.get('respondentId')
+    respondent_email = payload.get('respondentEmail')
+    if respondent_id:
+        user = db.query(models.User).filter(models.User.id == respondent_id).first()
+        if not user:
+            if respondent_email:
+                # create a minimal user record to satisfy FK
+                try:
+                    user = models.User(id=respondent_id, email=respondent_email)
+                    db.add(user)
+                    db.flush()
+                except Exception:
+                    # if creating a user fails for any reason, fall back to anonymous
+                    respondent_id = None
+            else:
+                # no email supplied, don't create a user row; use anonymous
+                respondent_id = None
+
     response = models.FormResponse(
         id=rid,
         form_id=payload['formId'],
-        respondent_id=payload.get('respondentId'),
-        respondent_email=payload.get('respondentEmail'),
+        respondent_id=respondent_id,
+        respondent_email=respondent_email,
         reference_id=payload.get('referenceId'),
         reference_type=payload.get('referenceType'),
         status=payload.get('status') or 'submitted',
@@ -92,11 +151,28 @@ def submit_response(db: Session, payload: dict) -> models.FormResponse:
     answers = payload.get('answers', [])
     for a in answers:
         aid = gen_id()
+        # derive a human-readable answer_text when frontend sends structured
+        # JSON (arrays/objects) in `answerJson` but does not populate
+        # `answerText`. This keeps historical text searchable and readable.
+        ans_text = a.get('answerText')
+        if not ans_text:
+            aj = a.get('answerJson')
+            if aj is not None:
+                try:
+                    if isinstance(aj, list):
+                        ans_text = ", ".join(str(x) for x in aj)
+                    elif isinstance(aj, dict):
+                        ans_text = json.dumps(aj)
+                    else:
+                        ans_text = str(aj)
+                except Exception:
+                    ans_text = None
+
         ans = models.Answer(
             id=aid,
             response_id=response.id,
             question_id=a['questionId'],
-            answer_text=a.get('answerText'),
+            answer_text=ans_text,
             answer_number=a.get('answerNumber'),
             answer_date=a.get('answerDate'),
             answer_json=a.get('answerJson'),
@@ -113,12 +189,26 @@ def _evaluate_condition(condition: dict, answer_value: Any) -> bool:
     val = condition.get('value')
     # simple operators supported
     try:
+        # normalize string comparisons for human-entered text
         if op == 'equals':
-            return answer_value == val
+            if isinstance(answer_value, list):
+                return any(str(x).lower() == str(val).lower() for x in answer_value)
+            return str(answer_value).lower() == str(val).lower()
         if op == 'not_equals':
-            return answer_value != val
+            if isinstance(answer_value, list):
+                return not any(str(x).lower() == str(val).lower() for x in answer_value)
+            return str(answer_value).lower() != str(val).lower()
         if op == 'contains':
-            return val is not None and str(val) in str(answer_value or '')
+            if val is None:
+                return False
+            # if answer_value is a list, check membership or substring in any item
+            if isinstance(answer_value, list):
+                v_lower = str(val).lower()
+                for item in answer_value:
+                    if v_lower in str(item).lower():
+                        return True
+                return False
+            return str(val).lower() in str(answer_value or '').lower()
         if op == 'greater_than':
             return float(answer_value) > float(val)
         if op == 'less_than':
@@ -244,11 +334,28 @@ def update_answers(db: Session, response_id: str, answers: List[dict]):
     created = []
     for a in answers:
         aid = gen_id()
+        # same derivation used in submit_response: prefer explicit answerText,
+        # otherwise try to coerce answerJson into a readable string for
+        # answer_text
+        ans_text = a.get('answerText')
+        if not ans_text:
+            aj = a.get('answerJson')
+            if aj is not None:
+                try:
+                    if isinstance(aj, list):
+                        ans_text = ", ".join(str(x) for x in aj)
+                    elif isinstance(aj, dict):
+                        ans_text = json.dumps(aj)
+                    else:
+                        ans_text = str(aj)
+                except Exception:
+                    ans_text = None
+
         ans = models.Answer(
             id=aid,
             response_id=response_id,
             question_id=a['questionId'],
-            answer_text=a.get('answerText'),
+            answer_text=ans_text,
             answer_number=a.get('answerNumber'),
             answer_date=a.get('answerDate'),
             answer_json=a.get('answerJson'),
@@ -261,8 +368,35 @@ def update_answers(db: Session, response_id: str, answers: List[dict]):
 
 def create_questions(db: Session, form_id: str, questions: List[dict]):
     created = []
+
+    # Similar to create_form: allow a batch of questions that reference each
+    # other using temporary ids. Build id_map and remap conditional logic
+    # references before persisting.
+    id_map: dict = {}
+    for q in questions:
+        incoming_id = q.get('id')
+        if incoming_id and str(incoming_id).startswith('temp-'):
+            id_map[incoming_id] = gen_id()
+        elif incoming_id:
+            id_map[incoming_id] = incoming_id
+        else:
+            id_map[incoming_id] = gen_id()
+
     for idx, q in enumerate(questions):
-        qid = q.get('id') or gen_id()
+        incoming_id = q.get('id')
+        qid = id_map.get(incoming_id) or gen_id()
+
+        cl = q.get('conditional_logic') or q.get('conditionalLogic')
+        if cl:
+            try:
+                conditions = cl.get('conditions') or []
+                for cond in conditions:
+                    dep = cond.get('questionId')
+                    if dep in id_map:
+                        cond['questionId'] = id_map[dep]
+            except Exception:
+                pass
+
         question = models.Question(
             id=qid,
             form_id=form_id,
@@ -270,7 +404,7 @@ def create_questions(db: Session, form_id: str, questions: List[dict]):
             question_type=q.get('question_type') or q.get('questionType'),
             options=q.get('options'),
             validation_rules=q.get('validation_rules') or q.get('validationRules'),
-            conditional_logic=q.get('conditional_logic') or q.get('conditionalLogic'),
+            conditional_logic=cl,
             is_required=q.get('is_required') or q.get('isRequired', False),
             order_index=q.get('order_index') or q.get('orderIndex') or idx,
             section=q.get('section'),

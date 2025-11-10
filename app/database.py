@@ -8,7 +8,10 @@ load_dotenv()
 DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql://pgadmin:secret@localhost:5432/formbricks')
 
 # echo=True for debugging; keep False normally
-engine = create_engine(DATABASE_URL, future=True)
+# enable pool_pre_ping so SQLAlchemy tests connections before using them; this
+# helps avoid "SSL connection has been closed unexpectedly" errors when the
+# DB server closes idle connections.
+engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 Base = declarative_base()

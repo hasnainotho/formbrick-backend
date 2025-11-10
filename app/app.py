@@ -213,6 +213,58 @@ def assign_form(ticket_id: str, payload: schemas.AssignFormPayload, db: Session 
     return {'ticket': {'id': ticket.id, 'assigned_form_id': ticket.assigned_form_id}}
 
 
+@app.post('/admin/forms/{form_id}/remap-conditions')
+def remap_form_conditions(form_id: str, payload: dict, db: Session = Depends(get_db)):
+    """
+    Admin helper to remap conditional logic questionId references for an existing form.
+
+    Payload shape:
+      {
+        "mappings": { "temp-123": "real-uuid-1", "temp-456": "real-uuid-2" },
+        "dry_run": true    # optional, defaults to true
+      }
+
+    Returns a list of proposed changes; if dry_run is false the changes are persisted.
+    """
+    mappings = payload.get('mappings') or {}
+    dry_run = payload.get('dry_run', True)
+
+    if not mappings:
+        return {'error': 'mappings required', 'mappings': mappings}
+
+    form = crud.get_form(db, form_id)
+    if not form:
+        raise HTTPException(status_code=404, detail='Form not found')
+
+    changes = []
+
+    for q in form.questions:
+        cl = q.conditional_logic or {}
+        if not cl:
+            continue
+        modified = False
+        try:
+            conditions = cl.get('conditions') or []
+            for cond in conditions:
+                old = cond.get('questionId')
+                if old in mappings and mappings[old]:
+                    cond['questionId'] = mappings[old]
+                    changes.append({'question_id': q.id, 'old': old, 'new': mappings[old]})
+                    modified = True
+        except Exception:
+            continue
+
+        if modified and not dry_run:
+            # write back updated conditional_logic
+            q.conditional_logic = cl
+            db.add(q)
+
+    if not dry_run and changes:
+        db.commit()
+
+    return {'form_id': form_id, 'dry_run': dry_run, 'changes': changes}
+
+
 @app.post('/responses')
 def submit_response(payload: schemas.SubmitResponse, db: Session = Depends(get_db)):
     # Create response and answers
